@@ -274,6 +274,12 @@ static void process_command_response(uint32_t status, sdmmc_command_t* cmd)
         }
         ESP_LOGD(TAG, "%s: error %d", __func__, cmd->error);
     }
+    ESP_LOGV(TAG, "%s: response %08x %08x %08x %08x err=0x%x", __func__,
+            cmd->response[0],
+            cmd->response[1],
+            cmd->response[2],
+            cmd->response[3],
+            cmd->error);
 }
 
 static void process_data_status(uint32_t status, sdmmc_command_t* cmd)

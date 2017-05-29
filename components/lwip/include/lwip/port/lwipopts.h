@@ -374,7 +374,8 @@
  * The stack size value itself is platform-dependent, but is passed to
  * sys_thread_new() when the thread is created.
  */
-#define TCPIP_THREAD_STACKSIZE          ESP_TASK_TCPIP_STACK
+//#define TCPIP_THREAD_STACKSIZE          ESP_TASK_TCPIP_STACK
+#define TCPIP_THREAD_STACKSIZE          2*ESP_TASK_TCPIP_STACK
 
 /**
  * TCPIP_THREAD_PRIO: The priority assigned to the main tcpip thread.

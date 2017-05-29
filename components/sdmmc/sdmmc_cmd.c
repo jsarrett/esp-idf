@@ -37,17 +37,21 @@ static esp_err_t sdmmc_decode_cid(sdmmc_response_t resp, sdmmc_cid_t* out_cid);
 static esp_err_t sddmc_send_cmd_all_send_cid(sdmmc_card_t* card, sdmmc_cid_t* out_cid);
 static esp_err_t sdmmc_send_cmd_set_relative_addr(sdmmc_card_t* card, uint16_t* out_rca);
 static esp_err_t sdmmc_send_cmd_set_blocklen(sdmmc_card_t* card, sdmmc_csd_t* csd);
-static esp_err_t sdmmc_decode_csd(sdmmc_response_t response, sdmmc_csd_t* out_csd);
+static esp_err_t mmc_decode_csd(sdmmc_response_t response, sdmmc_csd_t* out_csd);
+static esp_err_t sd_decode_csd(sdmmc_response_t response, sdmmc_csd_t* out_csd);
 static esp_err_t sdmmc_send_cmd_send_csd(sdmmc_card_t* card, sdmmc_csd_t* out_csd);
+static esp_err_t sdmmc_mem_send_cxd_data(sdmmc_card_t* card , int opcode, void *data, size_t datalen);
 static esp_err_t sdmmc_send_cmd_select_card(sdmmc_card_t* card);
 static esp_err_t sdmmc_decode_scr(uint32_t *raw_scr, sdmmc_scr_t* out_scr);
 static esp_err_t sdmmc_send_cmd_send_scr(sdmmc_card_t* card, sdmmc_scr_t *out_scr);
 static esp_err_t sdmmc_send_cmd_set_bus_width(sdmmc_card_t* card, int width);
+static esp_err_t sdmmc_mmc_command_set(sdmmc_card_t* card, uint8_t set);
+static esp_err_t sdmmc_mmc_switch(sdmmc_card_t* card, uint8_t set, uint8_t index, uint8_t value);
 static esp_err_t sdmmc_send_cmd_stop_transmission(sdmmc_card_t* card, uint32_t* status);
 static esp_err_t sdmmc_send_cmd_send_status(sdmmc_card_t* card, uint32_t* out_status);
 static uint32_t  get_host_ocr(float voltage);
 
-
+#include "soc/sdmmc_struct.h"
 esp_err_t sdmmc_card_init(const sdmmc_host_t* config,
         sdmmc_card_t* card)
 {
@@ -71,11 +75,19 @@ esp_err_t sdmmc_card_init(const sdmmc_host_t* config,
         ESP_LOGE(TAG, "%s: send_if_cond (1) returned 0x%x", __func__, err);
         return err;
     }
+mmc_mode:
     err = sdmmc_send_cmd_send_op_cond(card, host_ocr, &card->ocr);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s: send_op_cond (1) returned 0x%x", __func__, err);
-        return err;
+    if (err == ESP_ERR_TIMEOUT) {
+        ESP_LOGI(TAG, "couldn't read ocr, trying as an MMC card");
+        card->host.flags |= SDMMC_HOST_MMC_CARD;    //should this also set it in host config passed in?
+        goto mmc_mode;
+    } else {
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "%s: send_op_cond (1) returned 0x%x", __func__, err);
+            return err;
+        }
     }
+
     host_ocr &= card->ocr;
     ESP_LOGD(TAG, "sdmmc_card_init: host_ocr=%08x, card_ocr=%08x", host_ocr, card->ocr);
     err = sddmc_send_cmd_all_send_cid(card, &card->cid);
@@ -112,69 +124,262 @@ esp_err_t sdmmc_card_init(const sdmmc_host_t* config,
             return err;
         }
     }
-    err = sdmmc_send_cmd_send_scr(card, &card->scr);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s: send_scr returned 0x%x", __func__, err);
-        return err;
-    }
-    if ((config->flags & SDMMC_HOST_FLAG_4BIT) &&
-        (card->scr.bus_width & SCR_SD_BUS_WIDTHS_4BIT)) {
-        ESP_LOGD(TAG, "switching to 4-bit bus mode");
-        err = sdmmc_send_cmd_set_bus_width(card, 4);
+    if (card->host.flags & SDMMC_HOST_MMC_CARD) {
+        /* sdmmc_mem_mmc_init */
+        int width, value;
+        int card_type;
+        uint8_t ext_csd[512];
+        int speed = 20000;
+        uint8_t powerclass = 0;
+#define SDMMC_TIMING_LEGACY 0
+#define SDMMC_TIMING_HIGHSPEED 1
+#define SDMMC_TIMING_MMC_DDR52 2
+        int timing = SDMMC_TIMING_LEGACY;
+        uint32_t sectors = 0;
+
+ESP_LOGE(TAG, "mmc_ver: %d", card->csd.mmc_ver);
+        if (card->csd.mmc_ver >= MMC_CSD_MMCVER_4_0) {
+            /* read EXT_CSD */
+            err = sdmmc_mem_send_cxd_data(card,
+                    MMC_SEND_EXT_CSD, ext_csd, sizeof(ext_csd));
+            if (err != ESP_OK) {
+                //SET(card->flags, SFF_ERROR);
+                ESP_LOGE(TAG, "%s: can't read EXT_CSD\n", __func__);
+                return err;
+            }
+
+            card_type = ext_csd[EXT_CSD_CARD_TYPE];
+#if 0
+/* despite accepting the command, the ext_CSD reads back as 0, so don't bother. */
+            err = sdmmc_mmc_command_set(card, EXT_CSD_CMD_SET_NORMAL);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "%s: can't set command set: %d\n", __func__, EXT_CSD_CMD_SET_NORMAL);
+                return err;
+            }
+            err = sdmmc_mem_send_cxd_data(card,
+                    MMC_SEND_EXT_CSD, ext_csd, sizeof(ext_csd));
+            if (err != ESP_OK) {
+                //SET(card->flags, SFF_ERROR);
+                ESP_LOGE(TAG, "%s: can't read EXT_CSD\n", __func__);
+                return err;
+            }
+            ESP_LOGD(TAG, "cmd_set: %d", ext_csd[EXT_CSD_CMD_SET]);
+            ESP_LOGD(TAG, "s_cmd_set: %d", ext_csd[EXT_CSD_S_CMD_SET]);
+#endif
+
+            //NOTE: ESP32 doesn't support DDR
+            if (card_type & EXT_CSD_CARD_TYPE_F_52M_1_8V) {
+                speed = 52000;
+                timing = SDMMC_TIMING_HIGHSPEED;
+            } else if (card_type & EXT_CSD_CARD_TYPE_F_52M) {
+                speed = 52000;
+                timing = SDMMC_TIMING_HIGHSPEED;
+            } else if (card_type & EXT_CSD_CARD_TYPE_F_26M) {
+                speed = 26000;
+            } else {
+                ESP_LOGE(TAG, "%s: unknown CARD_TYPE 0x%x\n", __func__,
+                        ext_csd[EXT_CSD_CARD_TYPE]);
+            }
+
+            if (timing != SDMMC_TIMING_LEGACY) {
+                /* switch to high speed timing */
+                err = sdmmc_mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+                        EXT_CSD_HS_TIMING, EXT_CSD_HS_TIMING_HS);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "%s: can't change high speed\n",
+                            __func__);
+                    return err;
+                }
+                ets_delay_us(10000);
+            }
+
+            if (config->max_freq_khz >= SDMMC_FREQ_HIGHSPEED &&
+                    speed >= SDMMC_FREQ_HIGHSPEED) {
+                ESP_LOGD(TAG, "switching to HS bus mode");
+                err = (*config->set_card_clk)(config->slot, SDMMC_FREQ_HIGHSPEED);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "failed to switch peripheral to HS bus mode");
+                    return err;
+                }
+            } else if (config->max_freq_khz >= SDMMC_FREQ_DEFAULT &&
+                    speed >= SDMMC_FREQ_DEFAULT) {
+                ESP_LOGD(TAG, "switching to DS bus mode");
+                err = (*config->set_card_clk)(config->slot, SDMMC_FREQ_DEFAULT);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "failed to switch peripheral to HS bus mode");
+                    return err;
+                }
+            }
+
+            if (timing != SDMMC_TIMING_LEGACY) {
+                /* read EXT_CSD again */
+                err = sdmmc_mem_send_cxd_data(card,
+                        MMC_SEND_EXT_CSD, ext_csd, sizeof(ext_csd));
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "%s: can't re-read EXT_CSD\n", __func__);
+                    return err;
+                }
+                if (ext_csd[EXT_CSD_HS_TIMING] != EXT_CSD_HS_TIMING_HS) {
+                    ESP_LOGE(TAG, "%s, HS_TIMING set failed\n", __func__);
+                    return ESP_ERR_INVALID_RESPONSE;
+                }
+            }
+
+            if (card->host.flags & SDMMC_HOST_FLAG_8BIT) {
+                width = 8;
+                value = EXT_CSD_BUS_WIDTH_8;
+                powerclass = ext_csd[(speed > 26000) ? EXT_CSD_PWR_CL_52_360 : EXT_CSD_PWR_CL_26_360] >> 4;
+            } else if (card->host.flags & SDMMC_HOST_FLAG_4BIT) {
+                width = 4;
+                value = EXT_CSD_BUS_WIDTH_4;
+                powerclass = ext_csd[(speed > 26000) ? EXT_CSD_PWR_CL_52_360 : EXT_CSD_PWR_CL_26_360] & 0x0f;
+            } else {
+                width = 1;
+                value = EXT_CSD_BUS_WIDTH_1;
+                powerclass = 0; //card must be able to do full rate at powerclass 0 in 1-bit mode
+            }
+            if (powerclass != 0) {
+                err = sdmmc_mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+                        EXT_CSD_POWER_CLASS, powerclass);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "%s: can't change power class"
+                                " (%d bit)\n", __func__, powerclass);
+                    return err;
+                }
+            }
+            if (width != 1) {
+                err = sdmmc_mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+                        EXT_CSD_BUS_WIDTH, value);
+                if (err == ESP_OK) {
+                    err = (*config->set_bus_width)(config->slot, width);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "slot->set_bus_width failed");
+                        return err;
+                    }
+                } else {
+                    ESP_LOGE(TAG, "%s: can't change bus width"
+                                " (%d bit)\n", __func__, width);
+                    return err;
+                }
+
+                /* XXXX: need bus test? (using by CMD14 & CMD19) */
+                ets_delay_us(10000);
+            }
+
+            /* EPS32 doesn't suport DDR
+            if (timing == SDMMC_TIMING_MMC_DDR52) {
+                switch (width) {
+                    case 4:
+                        value = EXT_CSD_BUS_WIDTH_4_DDR;
+                        break;
+                    case 8:
+                        value = EXT_CSD_BUS_WIDTH_8_DDR;
+                        break;
+                }
+
+                error = sdmmc_mmc_switch(sf, EXT_CSD_CMD_SET_NORMAL,
+                        EXT_CSD_BUS_WIDTH, value);
+                if (error) {
+                    ESP_LOGE(TAG, "%s: can't switch to DDR\n",
+                            __func__);
+                    return error;
+                }
+
+                sdmmc_delay(10000);
+
+                error = sdmmc_chip_signal_voltage(card->sct, card->sch,
+                        SDMMC_SIGNAL_VOLTAGE_180);
+                if (error) {
+                    ESP_LOGE(TAG, "%s: can't switch signalling voltage\n",
+                            __func__);
+                    return error;
+                }
+
+                error = sdmmc_chip_bus_clock(card->sct, card->sch, speed, timing);
+                if (error != 0) {
+                    ESP_LOGE(TAG, "%s: can't change bus clock\n", __func__);
+                    return error;
+                }
+
+                sdmmc_delay(10000);
+            }
+            */
+
+            sectors = ext_csd[EXT_CSD_SEC_COUNT + 0] << 0 |
+                ext_csd[EXT_CSD_SEC_COUNT + 1] << 8  |
+                ext_csd[EXT_CSD_SEC_COUNT + 2] << 16 |
+                ext_csd[EXT_CSD_SEC_COUNT + 3] << 24;
+
+            if (sectors > (2u * 1024 * 1024 * 1024) / 512) {
+                //card->flags |= SFF_SDHC;
+                card->csd.capacity = sectors;
+            }
+        }
+    } else {
+        err = sdmmc_send_cmd_send_scr(card, &card->scr);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "set_bus_width failed");
+            ESP_LOGE(TAG, "%s: send_scr returned 0x%x", __func__, err);
             return err;
         }
-        err = (*config->set_bus_width)(config->slot, 4);
+        if ((config->flags & SDMMC_HOST_FLAG_4BIT) &&
+                (card->scr.bus_width & SCR_SD_BUS_WIDTHS_4BIT)) {
+            ESP_LOGD(TAG, "switching to 4-bit bus mode");
+            err = sdmmc_send_cmd_set_bus_width(card, 4);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "set_bus_width failed");
+                return err;
+            }
+            err = (*config->set_bus_width)(config->slot, 4);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "slot->set_bus_width failed");
+                return err;
+            }
+            uint32_t status;
+            err = sdmmc_send_cmd_stop_transmission(card, &status);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "stop_transmission failed (0x%x)", err);
+                return err;
+            }
+        }
+        uint32_t status = 0;
+        while (!(status & MMC_R1_READY_FOR_DATA)) {
+            // TODO: add some timeout here
+            uint32_t count = 0;
+            err = sdmmc_send_cmd_send_status(card, &status);
+            if (err != ESP_OK) {
+                return err;
+            }
+            if (++count % 10 == 0) {
+                ESP_LOGV(TAG, "waiting for card to become ready (%d)", count);
+            }
+        }
+        if (config->max_freq_khz >= SDMMC_FREQ_HIGHSPEED &&
+                card->csd.tr_speed / 1000 >= SDMMC_FREQ_HIGHSPEED) {
+            ESP_LOGD(TAG, "switching to HS bus mode");
+            err = (*config->set_card_clk)(config->slot, SDMMC_FREQ_HIGHSPEED);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "failed to switch peripheral to HS bus mode");
+                return err;
+            }
+        } else if (config->max_freq_khz >= SDMMC_FREQ_DEFAULT &&
+                card->csd.tr_speed / 1000 >= SDMMC_FREQ_DEFAULT) {
+            ESP_LOGD(TAG, "switching to DS bus mode");
+            err = (*config->set_card_clk)(config->slot, SDMMC_FREQ_DEFAULT);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "failed to switch peripheral to HS bus mode");
+                return err;
+            }
+        }
+        sdmmc_scr_t scr_tmp;
+        err = sdmmc_send_cmd_send_scr(card, &scr_tmp);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "slot->set_bus_width failed");
+            ESP_LOGE(TAG, "%s: send_scr returned 0x%x", __func__, err);
             return err;
         }
-        uint32_t status;
-        err = sdmmc_send_cmd_stop_transmission(card, &status);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "stop_transmission failed (0x%x)", err);
-            return err;
+        if (memcmp(&card->scr, &scr_tmp, sizeof(scr_tmp)) != 0) {
+            ESP_LOGE(TAG, "data check fail!");
+            return ESP_ERR_INVALID_RESPONSE;
         }
-    }
-    uint32_t status = 0;
-    while (!(status & MMC_R1_READY_FOR_DATA)) {
-        // TODO: add some timeout here
-        uint32_t count = 0;
-        err = sdmmc_send_cmd_send_status(card, &status);
-        if (err != ESP_OK) {
-            return err;
-        }
-        if (++count % 10 == 0) {
-            ESP_LOGV(TAG, "waiting for card to become ready (%d)", count);
-        }
-    }
-    if (config->max_freq_khz >= SDMMC_FREQ_HIGHSPEED &&
-        card->csd.tr_speed / 1000 >= SDMMC_FREQ_HIGHSPEED) {
-        ESP_LOGD(TAG, "switching to HS bus mode");
-        err = (*config->set_card_clk)(config->slot, SDMMC_FREQ_HIGHSPEED);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "failed to switch peripheral to HS bus mode");
-            return err;
-        }
-    } else if (config->max_freq_khz >= SDMMC_FREQ_DEFAULT &&
-        card->csd.tr_speed / 1000 >= SDMMC_FREQ_DEFAULT) {
-        ESP_LOGD(TAG, "switching to DS bus mode");
-        err = (*config->set_card_clk)(config->slot, SDMMC_FREQ_DEFAULT);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "failed to switch peripheral to HS bus mode");
-            return err;
-        }
-    }
-    sdmmc_scr_t scr_tmp;
-    err = sdmmc_send_cmd_send_scr(card, &scr_tmp);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s: send_scr returned 0x%x", __func__, err);
-        return err;
-    }
-    if (memcmp(&card->scr, &scr_tmp, sizeof(scr_tmp)) != 0) {
-        ESP_LOGE(TAG, "data check fail!");
-        return ESP_ERR_INVALID_RESPONSE;
     }
     return ESP_OK;
 }
@@ -262,14 +467,23 @@ static esp_err_t sdmmc_send_cmd_send_if_cond(sdmmc_card_t* card, uint32_t ocr)
 
 static esp_err_t sdmmc_send_cmd_send_op_cond(sdmmc_card_t* card, uint32_t ocr, uint32_t *ocrp)
 {
-    sdmmc_command_t cmd = {
-            .arg = ocr,
-            .flags = SCF_CMD_BCR | SCF_RSP_R3,
-            .opcode = SD_APP_OP_COND
-    };
+    esp_err_t err;
+
+    sdmmc_command_t cmd;
     int nretries = 100;   // arbitrary, BSD driver uses this value
     for (; nretries != 0; --nretries)  {
-        esp_err_t err = sdmmc_send_app_cmd(card, &cmd);
+        bzero(&cmd, sizeof cmd);
+        cmd.arg = ocr;
+        cmd.flags = SCF_CMD_BCR | SCF_RSP_R3;
+        if (card->host.flags & SDMMC_HOST_MMC_CARD) { /* MMC mode */
+            cmd.arg &= ~MMC_OCR_ACCESS_MODE_MASK;
+            cmd.arg |= MMC_OCR_SECTOR_MODE;
+            cmd.opcode = MMC_SEND_OP_COND;
+            err = sdmmc_send_cmd(card, &cmd);
+        } else { /* SD mode */
+            cmd.opcode = SD_APP_OP_COND;
+            err = sdmmc_send_app_cmd(card, &cmd);
+        }
         if (err != ESP_OK) {
             return err;
         }
@@ -341,21 +555,49 @@ static esp_err_t sdmmc_send_cmd_set_blocklen(sdmmc_card_t* card, sdmmc_csd_t* cs
     return sdmmc_send_cmd(card, &cmd);
 }
 
-static esp_err_t sdmmc_decode_csd(sdmmc_response_t response, sdmmc_csd_t* out_csd)
+static esp_err_t mmc_decode_csd(sdmmc_response_t response, sdmmc_csd_t* out_csd)
+{
+    out_csd->csd_ver = MMC_CSD_CSDVER(response);
+    if (out_csd->csd_ver == MMC_CSD_CSDVER_1_0 ||
+            out_csd->csd_ver == MMC_CSD_CSDVER_2_0 ||
+            out_csd->csd_ver == MMC_CSD_CSDVER_EXT_CSD) {
+        out_csd->mmc_ver = MMC_CSD_MMCVER(response);
+        out_csd->capacity = MMC_CSD_CAPACITY(response);
+        out_csd->read_block_len = MMC_CSD_READ_BL_LEN(response);
+    } else {
+        ESP_LOGE(TAG, "unknown MMC CSD structure version 0x%x\n", out_csd->csd_ver);
+        return 1;
+    }
+    int read_bl_size = 1 << out_csd->read_block_len;
+    out_csd->sector_size = MIN(read_bl_size, 512);
+    if (out_csd->sector_size < read_bl_size) {
+        out_csd->capacity *= read_bl_size / out_csd->sector_size;
+    }
+    /* MMC special handling? */
+    int speed = SD_CSD_SPEED(response);
+    if (speed == SD_CSD_SPEED_50_MHZ) {
+        out_csd->tr_speed = 50000000;
+    } else {
+        out_csd->tr_speed = 25000000;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t sd_decode_csd(sdmmc_response_t response, sdmmc_csd_t* out_csd)
 {
     out_csd->csd_ver = SD_CSD_CSDVER(response);
     switch (out_csd->csd_ver) {
-    case SD_CSD_CSDVER_2_0:
-        out_csd->capacity = SD_CSD_V2_CAPACITY(response);
-        out_csd->read_block_len = SD_CSD_V2_BL_LEN;
-        break;
-    case SD_CSD_CSDVER_1_0:
-        out_csd->capacity = SD_CSD_CAPACITY(response);
-        out_csd->read_block_len = SD_CSD_READ_BL_LEN(response);
-        break;
-    default:
-        ESP_LOGE(TAG, "unknown SD CSD structure version 0x%x", out_csd->csd_ver);
-        return ESP_ERR_NOT_SUPPORTED;
+        case SD_CSD_CSDVER_2_0:
+            out_csd->capacity = SD_CSD_V2_CAPACITY(response);
+            out_csd->read_block_len = SD_CSD_V2_BL_LEN;
+            break;
+        case SD_CSD_CSDVER_1_0:
+            out_csd->capacity = SD_CSD_CAPACITY(response);
+            out_csd->read_block_len = SD_CSD_READ_BL_LEN(response);
+            break;
+        default:
+            ESP_LOGE(TAG, "unknown SD CSD structure version 0x%x", out_csd->csd_ver);
+            return ESP_ERR_NOT_SUPPORTED;
     }
     out_csd->card_command_class = SD_CSD_CCC(response);
     int read_bl_size = 1 << out_csd->read_block_len;
@@ -363,6 +605,7 @@ static esp_err_t sdmmc_decode_csd(sdmmc_response_t response, sdmmc_csd_t* out_cs
     if (out_csd->sector_size < read_bl_size) {
         out_csd->capacity *= read_bl_size / out_csd->sector_size;
     }
+    /* MMC special handling? */
     int speed = SD_CSD_SPEED(response);
     if (speed == SD_CSD_SPEED_50_MHZ) {
         out_csd->tr_speed = 50000000;
@@ -383,8 +626,49 @@ static esp_err_t sdmmc_send_cmd_send_csd(sdmmc_card_t* card, sdmmc_csd_t* out_cs
     if (err != ESP_OK) {
         return err;
     }
-    return sdmmc_decode_csd(cmd.response, out_csd);
+
+    if (card->host.flags & SDMMC_HOST_MMC_CARD) /* MMC mode */
+        err = mmc_decode_csd(cmd.response, out_csd);
+    else /* SD mode */
+        err = sd_decode_csd(cmd.response, out_csd);
+    return err;
 }
+
+static esp_err_t sdmmc_mem_send_cxd_data(sdmmc_card_t* card , int opcode, void *data, size_t datalen)
+{
+    sdmmc_command_t cmd;
+    void *ptr = NULL;
+    esp_err_t error = ESP_OK;
+
+    ptr = malloc(datalen);
+    if (ptr == NULL) {
+        error = ESP_ERR_NO_MEM;
+        goto out;
+    }
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.data = ptr;
+    cmd.datalen = datalen;
+    cmd.blklen = datalen;
+    cmd.opcode = opcode;
+    cmd.arg = 0;
+    cmd.flags = SCF_CMD_ADTC | SCF_CMD_READ;
+    if (opcode == MMC_SEND_EXT_CSD)
+        cmd.flags |= SCF_RSP_R1;
+    else
+        cmd.flags |= SCF_RSP_R2;
+
+    error = sdmmc_send_cmd(card, &cmd);
+    if (error == 0)
+        memcpy(data, ptr, datalen);
+
+out:
+    if (ptr != NULL)
+        free(ptr);
+
+    return error;
+}
+
 
 static esp_err_t sdmmc_send_cmd_select_card(sdmmc_card_t* card)
 {
@@ -447,6 +731,42 @@ static esp_err_t sdmmc_send_cmd_set_bus_width(sdmmc_card_t* card, int width)
     };
 
     return sdmmc_send_app_cmd(card, &cmd);
+}
+
+static esp_err_t sdmmc_mmc_command_set(sdmmc_card_t* card, uint8_t set)
+{
+    sdmmc_command_t cmd = {
+            .opcode = MMC_SWITCH,
+            .arg = (MMC_SWITCH_MODE_CMD_SET << 24) | set,
+            .flags = SCF_RSP_R1B | SCF_CMD_AC,
+            .data = 0,
+            .datalen = 0,
+            .blklen = 0,
+    };
+    esp_err_t err = sdmmc_send_cmd(card, &cmd);
+    if (err == ESP_OK) {
+        //check response bit to see that switch was accepted
+        if (cmd.response[0] & MMC_R1_SWITCH_ERROR)
+            err = ESP_ERR_INVALID_RESPONSE;
+    }
+
+    return err;
+}
+static esp_err_t sdmmc_mmc_switch(sdmmc_card_t* card, uint8_t set, uint8_t index, uint8_t value)
+{
+    sdmmc_command_t cmd = {
+            .opcode = MMC_SWITCH,
+            .arg = (MMC_SWITCH_MODE_WRITE_BYTE << 24) | (index << 16) | (value << 8) | set,
+            .flags = SCF_RSP_R1B | SCF_CMD_AC,
+    };
+    esp_err_t err = sdmmc_send_cmd(card, &cmd);
+    if (err == ESP_OK) {
+        //check response bit to see that switch was accepted
+        if (MMC_R1(cmd.response) & MMC_R1_SWITCH_ERROR)
+            err = ESP_ERR_INVALID_RESPONSE;
+    }
+
+    return err;
 }
 
 static esp_err_t sdmmc_send_cmd_stop_transmission(sdmmc_card_t* card, uint32_t* status)
