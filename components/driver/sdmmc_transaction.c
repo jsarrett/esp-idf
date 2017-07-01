@@ -210,10 +210,12 @@ static sdmmc_hw_cmd_t make_hw_cmd(sdmmc_command_t* cmd)
     } else {
         res.wait_complete = 1;
     }
+/*
     if (cmd->opcode == SD_APP_SET_BUS_WIDTH) {
         res.send_auto_stop = 1;
         res.data_expected = 1;
     }
+*/
     if (cmd->flags & SCF_RSP_PRESENT) {
         res.response_expect = 1;
         if (cmd->flags & SCF_RSP_136) {
