@@ -265,6 +265,20 @@ ESP_LOGE(TAG, "mmc_ver: %d", card->csd.mmc_ver);
                 /* XXXX: need bus test? (using by CMD14 & CMD19) */
                 ets_delay_us(10000);
             }
+#if 0
+ESP_LOGI(TAG, "got here okay!");
+/* read EXT_CSD */
+err = sdmmc_mem_send_cxd_data(card,
+        MMC_SEND_EXT_CSD, ext_csd, sizeof(ext_csd));
+if (err != ESP_OK) {
+    //SET(card->flags, SFF_ERROR);
+    ESP_LOGE(TAG, "%s: can't read EXT_CSD\n", __func__);
+    return err;
+}
+ESP_LOGI(TAG, "re-read ext_csd!");
+ESP_LOGE(TAG, "cmd_set: %d", ext_csd[EXT_CSD_CMD_SET]);
+ESP_LOGE(TAG, "s_cmd_set: %d", ext_csd[EXT_CSD_S_CMD_SET]);
+#endif
 
             /* EPS32 doesn't suport DDR
             if (timing == SDMMC_TIMING_MMC_DDR52) {
